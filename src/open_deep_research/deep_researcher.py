@@ -1,6 +1,6 @@
 """Main LangGraph implementation for the Deep Research agent."""
-
-import asyncio,json
+from pathlib import Path
+import asyncio,json,os
 from typing import Literal,Any
 from pydantic import BaseModel
 from langchain.chat_models import init_chat_model
@@ -16,10 +16,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
-from open_deep_research.configuration import (
+from src.open_deep_research.configuration import (
     Configuration,
 )
-from open_deep_research.prompts import (
+from src.open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
     compress_research_system_prompt,
@@ -28,7 +28,7 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
-from open_deep_research.state import (
+from src.open_deep_research.state import (
     AgentInputState,
     AgentState,
     ClarifyWithUser,
@@ -39,7 +39,7 @@ from open_deep_research.state import (
     ResearchQuestion,
     SupervisorState,
 )
-from open_deep_research.utils import (
+from src.open_deep_research.utils import (
     anthropic_websearch_called,
     get_all_tools,
     get_api_key_for_model,
@@ -50,6 +50,7 @@ from open_deep_research.utils import (
     openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
+    local_search_async
 )
 #原先为了解决deepseek模型返回格式有问题
 async def call_and_parse(model_instance: Any, messages: list, pydantic_model: type[BaseModel]) -> Any:
@@ -93,6 +94,13 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
 
     # 步骤2：准备用于结构化澄清分析的模型
     messages = state["messages"]
+    # 使用local_search工具分析用户资料库的内容
+    try:
+        print("开始查询本地")
+        document_summary  = await local_search_async(config)
+    except Exception as e:
+        # 如果读取本地目录或汇总失败，给一个容错的提示
+        document_summary = f"警告：本地资料库检索过程中出现错误：{str(e)}"
     model_config = {
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
@@ -107,28 +115,31 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(model_config)
     )
-    llm = configurable_model.with_config(model_config)
-    # 步骤3：分析是否需要澄清
     prompt_content = clarify_with_user_instructions.format(
         messages=get_buffer_string(messages),
+        document_summary = document_summary,
         date=get_today_str()
     )
-    #response = await call_and_parse(llm, [HumanMessage(content=prompt_content)], ClarifyWithUser)
     response = await clarification_model.ainvoke([HumanMessage(content=prompt_content)])
-    # 步骤4：根据分析结果进行路由
+    #如果需要澄清
     if response.need_clarification:
         # 结束流程并向用户返回澄清问题
         return Command(
             goto=END,
-            update={"messages": [AIMessage(content=response.question)]}
+            update={
+                "messages": [AIMessage(content=response.question)],
+                "document_summary": document_summary
+            }
         )
     else:
         # 进入研究环节并附带确认信息
         return Command(
             goto="write_research_brief",
-            update={"messages": [AIMessage(content=response.verification)]}
+            update={
+                "messages": [AIMessage(content=response.verification)],
+                "document_summary": document_summary
+            }
         )
-
 
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
     """将用户消息转换为结构化研究大纲，并初始化主管节点。
@@ -151,7 +162,6 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         "api_key": get_api_key_for_model(configurable.research_model, config),
         "tags": ["langsmith:nostream"]
     }
-    llm = configurable_model.with_config(research_model_config)
     # 配置用于结构化研究问题生成的模型
     research_model = (
         configurable_model
@@ -236,7 +246,6 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         }
     )
 
-
 async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
     """执行主管调用的工具，包括研究分配与策略思考。
 
@@ -265,7 +274,6 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         tool_call["name"] == "ResearchComplete"
         for tool_call in most_recent_message.tool_calls
     )
-
     # 满足任一终止条件则退出
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
         return Command(

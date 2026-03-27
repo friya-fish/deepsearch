@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 
 class SearchAPI(Enum):
-    """Enumeration of available search API providers."""
+    """可用的搜索 API 提供商枚举。"""
     
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
@@ -17,28 +17,28 @@ class SearchAPI(Enum):
     NONE = "none"
 
 class MCPConfig(BaseModel):
-    """Configuration for Model Context Protocol (MCP) servers."""
+    """模型上下文协议（Model Context Protocol, MCP）服务器的配置。"""
     
     url: Optional[str] = Field(
         default=None,
         optional=True,
     )
-    """The URL of the MCP server"""
+    """MCP 服务器的 URL 地址"""
     tools: Optional[List[str]] = Field(
         default=None,
         optional=True,
     )
-    """The tools to make available to the LLM"""
+    """可供大语言模型（LLM）使用的工具列表"""
     auth_required: Optional[bool] = Field(
         default=False,
         optional=True,
     )
-    """Whether the MCP server requires authentication"""
+    """MCP 服务器是否需要身份验证"""
 
 class Configuration(BaseModel):
-    """Main configuration class for the Deep Research agent."""
+    """深度研究智能体（Deep Research agent）的主配置类。"""
     
-    # General Configuration
+    # 通用配置
     max_structured_output_retries: int = Field(
         default=3,
         metadata={

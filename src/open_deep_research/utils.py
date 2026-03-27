@@ -28,10 +28,115 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
+from src.open_deep_research.configuration import Configuration, SearchAPI
+from src.open_deep_research.prompts import summarize_webpage_prompt
+from src.open_deep_research.state import ResearchComplete, Summary
 
-from open_deep_research.configuration import Configuration, SearchAPI
-from open_deep_research.prompts import summarize_webpage_prompt
-from open_deep_research.state import ResearchComplete, Summary
+
+
+##########################
+# Tavily Search Tool Utils
+##########################
+LOCAL_SEARCH_DESCRIPTION = (
+    "用于搜索本地资料库"
+)
+@tool(description=LOCAL_SEARCH_DESCRIPTION)
+async def local_search(
+    config: RunnableConfig = None
+) -> str:
+    print("------------------------开始使用工具--------------------------------")
+    return await local_search_async(config=config)
+
+
+async def local_search_async(
+    config: RunnableConfig = None
+):
+    directory_path = r"D:\FriyaProj\open_deep_research\local_knowledge"
+    configurable = Configuration.from_runnable_config(config)
+    if not os.path.exists(directory_path):
+        return f"未找到目录: {directory_path}"
+    files = [f for f in os.listdir(directory_path)
+             if f.endswith(('.pdf', '.docx', '.xlsx', '.txt', '.md'))]
+    tasks = [process_file(directory_path,f) for f in files]
+    file_contents_list = await asyncio.gather(*tasks)
+    file_contents = {filename: content for filename, content in file_contents_list}
+    print("开始使用工具")
+    print(f"file_contents 的类型：{type(file_contents)}")
+    #print(file_contents)
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    max_char_to_include = configurable.max_content_length
+    summarization_model = init_chat_model(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    ).with_structured_output(Summary,method="function_calling").with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
+    )
+
+    async def noop():
+        """No-op function for results without raw content."""
+        return None
+
+    summarization_tasks = [
+        noop() if not file_contents.get(file)
+        else summarize_webpage(
+            summarization_model,
+            file_contents[file][:max_char_to_include]
+        )
+        for file in files
+    ]
+    # Step 5: Execute all summarization tasks in parallel
+    summaries = await asyncio.gather(*summarization_tasks)
+    #print(f"summaries:{summaries}")
+    # Step 6: Combine results with their summaries
+    summarized_results = {
+        file: {
+            'title': file,
+            'content': file_contents[file][:max_char_to_include] if summary is None else summary
+        }
+        for file, summary in zip(
+            files,
+            summaries
+        )
+    }
+
+    # Step 7: Format the final output
+    if not summarized_results:
+        return "No valid search results found. Please try different search queries or use a different search API."
+
+    formatted_output = "Search results: \n\n"
+    for i, (title, result) in enumerate(summarized_results.items()):
+        formatted_output += f"\n\n--- SOURCE {i + 1}: {result['title']} ---\n"
+        formatted_output += f"FILE_NAME: {title}\n\n"
+        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+
+    return formatted_output
+
+
+async def process_file(file_path, filename):
+    print(f"file_path:{file_path},filename:{filename}")
+    file_path = os.path.join(file_path, filename)
+    try:
+        # 在线程池中运行同步的转换操作，避免阻塞异步循环
+        loop = asyncio.get_event_loop()
+        def read_file():
+            # 尝试文本读取，失败则提示
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except:
+                return "[非文本文件，无法直接读取内容]"
+
+        # 构造带格式的输出
+        content_text = await loop.run_in_executor(None, read_file)
+        content = f"\n\n--- 文件名: {filename} ---\n"
+        content += f"内容摘要/正文:\n{content_text}\n"
+        content += "-" * 50 + "\n"
+        return filename, content
+    except Exception as e:
+        return f"\n[错误] 无法解析文件 {filename}: {str(e)}\n"
 
 ##########################
 # Tavily Search Tool Utils
@@ -171,6 +276,7 @@ async def tavily_search_async(
     # Execute all search queries in parallel and return results
     search_results = await asyncio.gather(*search_tasks)
     return search_results
+
 
 async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
     """Summarize webpage content using AI model with timeout protection.
@@ -552,12 +658,18 @@ async def get_search_tool(search_api: SearchAPI):
     elif search_api == SearchAPI.TAVILY:
         # Configure Tavily search tool with metadata
         search_tool = tavily_search
+        local_search_tool = local_search
         search_tool.metadata = {
             **(search_tool.metadata or {}), 
             "type": "search", 
             "name": "web_search"
         }
-        return [search_tool]
+        local_search_tool.metadata = {
+            **(local_search_tool.metadata or {}),
+            "type": "search",
+            "name": "local_file_search"
+        }
+        return [search_tool,local_search_tool]
         
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
